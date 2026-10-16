@@ -1,38 +1,121 @@
-.App {
+/* src/App.css */
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: #121212;
+  color: #ffffff;
+}
+
+.dashboard-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.dashboard-header {
   text-align: center;
+  margin-bottom: 2rem;
 }
 
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
+.dashboard-header h1 {
+  margin: 0;
+  font-size: 2.5rem;
+  color: #00ff9d;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
-  }
+.dashboard-header p {
+  color: #888;
+  margin-top: 0.5rem;
 }
 
-.App-header {
-  background-color: #282c34;
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+.add-target-panel {
+  background: #1e1e1e;
+  padding: 1.5rem;
+  border-radius: 8px;
+  margin-bottom: 2rem;
+    display: flex;
   justify-content: center;
-  font-size: calc(10px + 2vmin);
+}
+
+.add-target-panel form {
+  display: flex;
+  gap: 1rem;
+  width: 100%;
+  max-width: 800px;
+}
+
+.add-target-panel input {
+  flex: 1;
+  padding: 0.75rem;
+  background: #2d2d2d;
+  border: 1px solid #333;
   color: white;
+  border-radius: 4px;
 }
 
-.App-link {
-  color: #61dafb;
+.add-target-panel button {
+  padding: 0.75rem 1.5rem;
+  background: #00ff9d;
+  color: #000;
+  border: none;
+  border-radius: 4px;
+  font-weight: bold;
+  cursor: pointer;
 }
 
-@keyframes App-logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+.targets-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  gap: 1.5rem;
+}
+
+.target-card {
+  background: #1e1e1e;
+  border-radius: 8px;
+  padding: 1.5rem;
+  border-top: 4px solid #333;
+}
+
+.target-card.online { border-top-color: #00ff9d; }
+.target-card.offline { border-top-color: #ff4444; }
+
+.target-info {
+  margin-bottom: 1.5rem;
+  position: relative;
+}
+
+.target-info h2 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1.5rem;
+}
+
+.target-info a {
+  color: #888;
+  text-decoration: none;
+}
+
+.status-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.25rem 0.75rem;
+  border-radius: 20px;
+  font-size: 0.8rem;
+  font-weight: bold;
+}
+
+.online .status-badge {
+  background: rgba(0, 255, 157, 0.2);
+  color: #00ff9d;
+}
+
+.offline .status-badge {
+  background: rgba(255, 68, 68, 0.2);
+  color: #ff4444;
+}
+
+.no-data {
+  text-align: center;
+  color: #888;
+  grid-column: 1 / -1;
 }
