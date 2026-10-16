@@ -1,0 +1,4 @@
+[startup] Scheduler started (every 30s).
+[17:54:19] Pinging active targets...
+ * Serving Flask app 'app'
+ * Debug mode: on
