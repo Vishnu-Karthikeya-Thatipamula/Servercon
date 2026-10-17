@@ -15,7 +15,8 @@ from datetime import datetime
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 app = Flask(__name__)
-CORS(app)  # Allows React (http://localhost:3000) to call this Flask API
+# Allow requests from all origins (including your localhost and future frontend host)
+CORS(app, resources={r"/api/*": {"origins": "*"}})# Allows React (http://localhost:3000) to call this Flask API
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
