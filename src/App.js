@@ -154,6 +154,35 @@ function App() {
     }
   };
 
+  const handleDeleteTarget = async (siteId, friendlyName) => {
+    if (siteId == null) return;
+    const label = friendlyName || `site ${siteId}`;
+    if (typeof window !== 'undefined' && !window.confirm(`Stop monitoring "${label}"? Its history will be deleted.`)) {
+      return;
+    }
+    // Optimistic removal so the card vanishes instantly; restored on failure.
+    let snapshot = null;
+    setTargets((prev) => {
+      snapshot = prev;
+      return prev.filter((t) => t.site_id !== siteId);
+    });
+    try {
+      await axios.delete(`${API_BASE}/api/targets/${siteId}`, { timeout: REQUEST_TIMEOUT_MS });
+      if (isMountedRef.current) setError('');
+    } catch (error) {
+      console.error('Failed to delete target', error);
+      if (isMountedRef.current) {
+        if (snapshot) setTargets(snapshot);
+        if (error?.response?.status === 404) {
+          setError(`"${label}" was already deleted. Refreshing…`);
+          fetchInitialData();
+        } else {
+          setError(`Delete failed: ${getFriendlyApiErrorMessage(error)}`);
+        }
+      }
+    }
+  };
+
   return (
     <div className="dashboard-container">
       <header className="dashboard-header">
@@ -193,9 +222,31 @@ function App() {
           targets.map((target, index) => {
             const logs = Array.isArray(target.uptime_logs) ? target.uptime_logs : [];
             return (
-            <div key={target.site_id ?? target.target_url ?? index} className={`target-card ${target.is_online ? 'online' : 'offline'}`}>
+            <div key={target.site_id ?? target.target_url ?? index} className={`target-card ${target.is_online ? 'online' : 'offline'}`} style={{ position: 'relative' }}>
+              <button
+                type="button"
+                aria-label={`Delete ${target.friendly_name || target.target_url || 'target'}`}
+                title="Stop monitoring this target"
+                onClick={() => handleDeleteTarget(target.site_id, target.friendly_name)}
+                style={{
+                  position: 'absolute',
+                  top: '10px',
+                  right: '10px',
+                  width: '28px',
+                  height: '28px',
+                  borderRadius: '50%',
+                  border: '1px solid #444',
+                  background: '#2d2d2d',
+                  color: '#ff6b6b',
+                  fontSize: '16px',
+                  lineHeight: '1',
+                  cursor: 'pointer',
+                }}
+              >
+                ×
+              </button>
               <div className="target-info">
-                <h2>{target.friendly_name || 'Unnamed target'}</h2>
+                <h2 style={{ paddingRight: '36px' }}>{target.friendly_name || 'Unnamed target'}</h2>
                 <a href={target.target_url} target="_blank" rel="noopener noreferrer">{target.target_url}</a>
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
                   <span className="status-badge">
