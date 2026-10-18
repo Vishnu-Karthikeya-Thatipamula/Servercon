@@ -1,5 +1,6 @@
 import atexit
 import os
+import re
 import time
 from urllib.parse import urlparse
 import requests
@@ -11,21 +12,62 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
 
 # Load .env that lives next to this file (works regardless of cwd).
-# File lives at servercon/backend/venv/app.py in this project.
+# File lives at servercon/backend/app.py in this project.
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 app = Flask(__name__)
 # Allow requests from all origins (including your localhost and future frontend host)
 CORS(app, resources={r"/api/*": {"origins": "*"}})# Allows React (http://localhost:3000) to call this Flask API
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_USER = os.getenv("DB_USER", "root")
+DB_HOST = os.getenv("DB_HOST", "localhost") or "localhost"
+DB_USER = os.getenv("DB_USER", "root") or "root"
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_NAME = os.getenv("DB_NAME", "uptime_monitor")
+DB_NAME = os.getenv("DB_NAME", "uptime_monitor") or "uptime_monitor"
 
-REQUEST_TIMEOUT = int(os.getenv("PING_TIMEOUT", "10"))
-PING_INTERVAL = int(os.getenv("PING_INTERVAL", "30"))
+
+def _int_env(name, default, min_value=None, max_value=None, aliases=()):
+    """Parse an int env var without ever crashing import/startup.
+
+    Empty / missing / non-numeric values fall back to ``default``
+    (with a warning) instead of raising ``ValueError`` from ``int()``.
+    Optional min/max clamping keeps scheduler/timeout values sane.
+    """
+    raw = os.getenv(name)
+    if (raw is None or str(raw).strip() == "") and aliases:
+        for alias in aliases:
+            alt = os.getenv(alias)
+            if alt is not None and str(alt).strip() != "":
+                raw = alt
+                break
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        print(f"[config] Invalid {name}={raw!r}; using default {default}.")
+        return default
+    if min_value is not None and value < min_value:
+        print(f"[config] {name}={value} below minimum {min_value}; clamped.")
+        return min_value
+    if max_value is not None and value > max_value:
+        print(f"[config] {name}={value} above maximum {max_value}; clamped.")
+        return max_value
+    return value
+
+
+DB_PORT = _int_env("DB_PORT", 3306, min_value=1, max_value=65535)
+# NOTE: historic env name is PING_TIMEOUT; also accept REQUEST_TIMEOUT.
+REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 10, min_value=1, max_value=120,
+                           aliases=("PING_TIMEOUT",))
+PING_INTERVAL = _int_env("PING_INTERVAL", 30, min_value=5, max_value=86400)
+
+# Fail fast on an unsafe database identifier since it is interpolated
+# into CREATE DATABASE (identifiers cannot be parameterised).
+if not re.fullmatch(r"[A-Za-z0-9_]+", DB_NAME):
+    raise SystemExit(
+        f"[config] Refusing to start: unsafe DB_NAME={DB_NAME!r}. "
+        "Use only letters, digits and underscore."
+    )
 
 
 def _safe_close(obj):
@@ -44,6 +86,16 @@ def _safe_close(obj):
         pass
 
 
+def _safe_rollback(conn):
+    """Best-effort rollback so one bad INSERT doesn't poison the batch."""
+    if conn is None:
+        return
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 # Database connection helper
 def get_db_connection(with_db=True):
     kwargs = {
@@ -51,6 +103,7 @@ def get_db_connection(with_db=True):
         "port": DB_PORT,
         "user": DB_USER,
         "password": DB_PASSWORD,
+        "connection_timeout": _int_env("DB_CONNECT_TIMEOUT", 10, min_value=1, max_value=60),
     }
     if with_db:
         kwargs["database"] = DB_NAME
@@ -106,64 +159,83 @@ def init_db():
         _safe_close(conn)
 
 # The Background Worker: Pings sites and saves to MySQL
-def ping_websites():
+def _ping_one(url):
+    """Ping a single URL. Returns (status_code, latency_ms, is_online)."""
+    status_code = 0
+    latency_ms = 0.0
+    is_online = False
+    try:
+        start_time = time.time()
+        response = requests.get(
+            url,
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": "UptimeMonitor/1.0"},
+        )
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+        status_code = response.status_code or 0
+        is_online = (200 <= status_code < 300)
+    except requests.exceptions.RequestException as exc:
+        print(f"[ping] {url} unreachable: {exc}")
+    except Exception as exc:  # defensive: never let one URL kill the batch
+        print(f"[ping] {url} unexpected error: {exc}")
+    return status_code, latency_ms, is_online
+
+
+def ping_websites(site_id=None):
+    """Ping all targets (or a single site_id) and log results to MySQL."""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Pinging active targets...")
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
-    except mysql.connector.Error as err:
+    except Exception as err:  # mysql errors + DNS/socket errors
         print(f"[ping] DB connection failed: {err}")
         return
     try:
         try:
             cursor = conn.cursor(dictionary=True)
-        except mysql.connector.Error as err:
+        except Exception as err:
             print(f"[ping] Could not create cursor: {err}")
             return
         try:
             try:
-                cursor.execute("SELECT site_id, target_url FROM monitored_targets")
+                if site_id is None:
+                    cursor.execute("SELECT site_id, target_url FROM monitored_targets")
+                else:
+                    cursor.execute(
+                        "SELECT site_id, target_url FROM monitored_targets WHERE site_id = %s",
+                        (site_id,),
+                    )
                 targets = cursor.fetchall()
             except mysql.connector.Error as err:
                 print(f"[ping] SELECT failed: {err}")
                 return
 
             for target in targets:
-                site_id = target['site_id']
+                target_id = target['site_id']
                 url = target['target_url']
-                status_code = 0
-                latency_ms = 0.0
-                is_online = False
 
-                try:
-                    start_time = time.time()
-                    response = requests.get(url, timeout=REQUEST_TIMEOUT)
-                    latency_ms = round((time.time() - start_time) * 1000, 2)
-                    status_code = response.status_code
-                    is_online = (200 <= status_code < 300)
-                except requests.exceptions.RequestException as exc:
-                    print(f"[ping] {url} unreachable: {exc}")
-                    latency_ms = 0.0
-                    status_code = 0
-                    is_online = False
+                status_code, latency_ms, is_online = _ping_one(url)
 
                 # Log the result (one target failing must not kill the whole batch)
                 try:
                     cursor.execute("""
                         INSERT INTO uptime_logs (site_id, status_code, latency_ms, is_online)
                         VALUES (%s, %s, %s, %s)
-                    """, (site_id, status_code, latency_ms, is_online))
+                    """, (target_id, status_code, latency_ms, is_online))
                 except mysql.connector.Error as err:
-                    print(f"[ping] INSERT failed for site {site_id}: {err}")
+                    print(f"[ping] INSERT failed for site {target_id}: {err}")
+                    _safe_rollback(conn)
                     continue
 
             try:
                 conn.commit()
             except mysql.connector.Error as err:
                 print(f"[ping] COMMIT failed: {err}")
+                _safe_rollback(conn)
         finally:
             _safe_close(cursor)
+            cursor = None
     finally:
         _safe_close(conn)
 
@@ -298,6 +370,7 @@ def add_target():
 
     conn = None
     cursor = None
+    new_id = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -308,17 +381,25 @@ def add_target():
         new_id = cursor.lastrowid
         conn.commit()
     except mysql.connector.Error as err:
+        _safe_rollback(conn)
         if getattr(err, 'errno', None) == 1062:
             return jsonify({"error": "That URL is already being monitored."}), 409
         return jsonify({"error": str(err)}), 400
+    except Exception as exc:
+        _safe_rollback(conn)
+        return jsonify({"error": f"Database error: {exc}"}), 500
     finally:
         _safe_close(cursor)
         _safe_close(conn)
 
-    # Trigger an immediate ping so the UI updates instantly.
+    if new_id is None:  # defensive: commit succeeded but no id returned
+        return jsonify({"error": "Insert succeeded but no id was returned."}), 500
+
+    # Trigger an immediate ping of JUST this target so the UI updates
+    # instantly (pinging everything here would be slow with many targets).
     # A ping failure must not turn a successful insert into an error.
     try:
-        ping_websites()
+        ping_websites(site_id=new_id)
     except Exception as exc:
         print(f"[add_target] immediate ping failed: {exc}")
 
@@ -339,7 +420,11 @@ def delete_target(site_id):
             return jsonify({"error": "Target not found."}), 404
         return jsonify({"message": "Target deleted successfully"}), 200
     except mysql.connector.Error as err:
+        _safe_rollback(conn)
         return jsonify({"error": str(err)}), 400
+    except Exception as exc:
+        _safe_rollback(conn)
+        return jsonify({"error": f"Database error: {exc}"}), 500
     finally:
         _safe_close(cursor)
         _safe_close(conn)
@@ -365,12 +450,17 @@ def not_found(e):
 @app.route('/api/health', methods=['GET'])
 def health():
     conn = None
+    cursor = None
     try:
         conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
         db_ok = True
     except Exception:
         db_ok = False
     finally:
+        _safe_close(cursor)
         _safe_close(conn)
     sched = scheduler  # may be None until start_scheduler() runs
     return jsonify({
@@ -381,10 +471,25 @@ def health():
     }), (200 if db_ok else 503)
 
 
+# Auto-start the scheduler when running under a WSGI server (Render/gunicorn).
+# Local `python app.py` still uses the __main__ block below. This is guarded so
+# tests/imports don't spawn threads unless explicitly enabled.
+if os.getenv("ENABLE_SCHEDULER", "false").lower() in ("1", "true", "yes"):
+    try:
+        init_db()
+    except Exception as exc:
+        print(f"[wsgi] DB init skipped/failed: {exc}")
+    try:
+        start_scheduler()
+        print("[wsgi] Background scheduler started.")
+    except Exception as exc:
+        print(f"[wsgi] Scheduler failed to start: {exc}")
+
+
 if __name__ == '__main__':
     try:
         init_db()
-    except mysql.connector.Error as err:
+    except Exception as err:  # mysql errors + DNS/socket/timeout errors
         print(f"[startup] MySQL init failed: {err}")
         print(f"[startup] Check DB_HOST={DB_HOST} DB_PORT={DB_PORT} "
               f"DB_USER={DB_USER} DB_NAME={DB_NAME} and that MySQL is running.")
