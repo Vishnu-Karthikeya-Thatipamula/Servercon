@@ -197,7 +197,24 @@ function App() {
               <div className="target-info">
                 <h2>{target.friendly_name || 'Unnamed target'}</h2>
                 <a href={target.target_url} target="_blank" rel="noopener noreferrer">{target.target_url}</a>
-                <span className="status-badge">{target.is_online ? 'ONLINE' : 'OFFLINE'}</span>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
+                  <span className="status-badge">
+                    {target.is_online ? 'ONLINE' : 'OFFLINE'}
+                  </span>
+                  <span
+                    title="Share of successful checks in the last 24 hours"
+                    style={{
+                      fontSize: '0.8rem',
+                      padding: '2px 8px',
+                      borderRadius: '12px',
+                      backgroundColor: '#262626',
+                      color: (target.uptime_pct ?? 100) >= 99 ? '#00ff9d' : (target.uptime_pct ?? 100) >= 95 ? '#ffcc00' : '#ff6b6b',
+                      border: '1px solid #333'
+                    }}
+                  >
+                    {target.uptime_pct !== undefined ? `${target.uptime_pct}% (24h)` : '100% (24h)'}
+                  </span>
+                </div>
               </div>
 
               <div className="chart-container" style={{ width: '100%', height: 220 }}>

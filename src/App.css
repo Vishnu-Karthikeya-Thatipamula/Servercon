@@ -95,13 +95,11 @@ body {
 }
 
 .status-badge {
-  position: absolute;
-  top: 0;
-  right: 0;
   padding: 0.25rem 0.75rem;
   border-radius: 20px;
   font-size: 0.8rem;
   font-weight: bold;
+  white-space: nowrap;
 }
 
 .online .status-badge {

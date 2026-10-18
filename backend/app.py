@@ -67,6 +67,26 @@ REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 10, min_value=1, max_value=120,
 # Bump to 5-10s if charts flatline or Aiven storage spikes.
 PING_INTERVAL = _int_env("PING_INTERVAL", 1, min_value=1, max_value=86400)
 
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+# Tracks the previous online/offline state of each site_id so webhooks fire
+# ONLY on state transitions (ONLINE->OFFLINE or OFFLINE->ONLINE), never on
+# every failed check. Seeded from DB on first ping cycle (see ping_websites).
+_last_known_status = {}
+
+
+def _send_webhook_alert(friendly_name, url, is_online, status_code):
+    """Fire a Discord/Slack-compatible webhook on a state transition."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    state_str = "🟢 RECOVERED (ONLINE)" if is_online else f"🔴 DOWN (Status: {status_code})"
+    payload = {
+        "content": f"**[Uptime Monitor Alert]**\n**Target:** {friendly_name} ({url})\n**Status:** {state_str}\n**Time (UTC):** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    }
+    try:
+        requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=5)
+    except Exception as exc:
+        print(f"[webhook] Failed to send alert: {exc}")
+
 # Fail fast on an unsafe database identifier since it is interpolated
 # into CREATE DATABASE (identifiers cannot be parameterised).
 if not re.fullmatch(r"[A-Za-z0-9_]+", DB_NAME):
@@ -158,6 +178,24 @@ def init_db():
                     FOREIGN KEY (site_id) REFERENCES monitored_targets(site_id) ON DELETE CASCADE
                 )
             """)
+            # Index for the 24h SLA aggregation + ranked history query.
+            # Critical at 1s ping intervals (~86k rows/target/day).
+            try:
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_logs_site_time
+                    ON uptime_logs (site_id, ping_timestamp DESC)
+                """)
+            except mysql.connector.Error:
+                # MySQL < 8 / MariaDB may not support IF NOT EXISTS on indexes;
+                # fall back to a plain CREATE and ignore "duplicate key" (1061).
+                try:
+                    cursor.execute("""
+                        CREATE INDEX idx_logs_site_time
+                        ON uptime_logs (site_id, ping_timestamp DESC)
+                    """)
+                except mysql.connector.Error as idx_err:
+                    if getattr(idx_err, 'errno', None) != 1061:
+                        raise
             conn.commit()
         finally:
             _safe_close(cursor)
@@ -229,10 +267,10 @@ def ping_websites(site_id=None, emit=True):
 
             try:
                 if site_id is None:
-                    cursor.execute("SELECT site_id, target_url FROM monitored_targets")
+                    cursor.execute("SELECT site_id, friendly_name, target_url FROM monitored_targets")
                 else:
                     cursor.execute(
-                        "SELECT site_id, target_url FROM monitored_targets WHERE site_id = %s",
+                        "SELECT site_id, friendly_name, target_url FROM monitored_targets WHERE site_id = %s",
                         (site_id,),
                     )
                 targets = cursor.fetchall()
@@ -243,9 +281,43 @@ def ping_websites(site_id=None, emit=True):
             if not targets:
                 return []
 
+            # Seed the transition tracker from the latest DB row so a server
+            # restart doesn't fire false DOWN/RECOVERED alerts for the state
+            # that already existed before boot.
+            if not _last_known_status:
+                try:
+                    cursor.execute("""
+                        SELECT t.site_id, l.is_online FROM monitored_targets t
+                        LEFT JOIN uptime_logs l ON l.log_id = (
+                            SELECT log_id FROM uptime_logs
+                            WHERE site_id = t.site_id
+                            ORDER BY ping_timestamp DESC, log_id DESC LIMIT 1
+                        )
+                    """)
+                    for row in cursor.fetchall():
+                        if row.get('is_online') is not None:
+                            _last_known_status[row['site_id']] = bool(row['is_online'])
+                except mysql.connector.Error as err:
+                    print(f"[ping] state-seed query failed (non-fatal): {err}")
+
             # PARALLEL PING: all targets at once
             with ThreadPoolExecutor(max_workers=PING_WORKERS) as executor:
                 results = list(executor.map(_ping_one, targets))
+
+            # STATE-TRANSITION ALERTS: fire webhook ONLY when a site flips
+            # ONLINE<->OFFLINE (never on every failed check -- no spam).
+            for target, res in zip(targets, results):
+                sid = target['site_id']
+                current_online = bool(res['is_online'])
+                prev_online = _last_known_status.get(sid)
+                if prev_online is not None and prev_online != current_online:
+                    _send_webhook_alert(
+                        target.get('friendly_name') or f"site {sid}",
+                        target['target_url'],
+                        current_online,
+                        res['status_code'],
+                    )
+                _last_known_status[sid] = current_online
 
             # BULK INSERT: one executemany instead of N single INSERTs
             try:
@@ -337,7 +409,23 @@ def get_targets():
         cursor.execute("SELECT site_id, friendly_name, target_url FROM monitored_targets ORDER BY site_id")
         targets = cursor.fetchall()
 
-        # Query 2: last HISTORY_LIMIT logs for every target in one shot
+        # Query 2: 24-hour SLA % for every target in ONE aggregation pass.
+        # At 1s pinging this scans ~86k rows/target/day -- the ping_timestamp
+        # index (created in init_db) keeps it fast even at that volume.
+        sla_rows = {}
+        try:
+            cursor.execute("""
+                SELECT site_id,
+                       ROUND(AVG(CASE WHEN is_online THEN 100.0 ELSE 0.0 END), 2) AS uptime_pct
+                FROM uptime_logs
+                WHERE ping_timestamp >= NOW() - INTERVAL 24 HOUR
+                GROUP BY site_id
+            """)
+            sla_rows = {row['site_id']: float(row['uptime_pct']) for row in cursor.fetchall()}
+        except mysql.connector.Error as err:
+            print(f"[targets] SLA aggregation failed (non-fatal, defaulting 100): {err}")
+
+        # Query 3: last HISTORY_LIMIT logs for every target in one shot
         cursor.execute("""
             WITH RankedLogs AS (
                 SELECT site_id, ping_timestamp, latency_ms, is_online,
@@ -378,6 +466,8 @@ def get_targets():
             target['uptime_logs'] = site_logs
             # Determine current status based on the most recent log
             target['is_online'] = bool(site_logs[-1]['is_online']) if site_logs else False
+            # 24h SLA badge: default 100 when a target has no logs in the window
+            target['uptime_pct'] = sla_rows.get(target['site_id'], 100.0)
 
         return jsonify(targets)
     except mysql.connector.Error as err:
