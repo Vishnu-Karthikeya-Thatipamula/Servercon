@@ -1,15 +1,30 @@
 // src/App.js
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
+import { io } from 'socket.io-client';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import './App.css';
 
-const API_BASE_RAW = process.env.REACT_APP_API_BASE || "https://servercon.onrender.com";
-const API_BASE = API_BASE_RAW.endsWith("/") ? API_BASE_RAW.slice(0, -1) : API_BASE_RAW;
-// Render free tier sleeps + has no always-on cron: poll slower than local
-// so each point on the chart is a real new ping, not a re-fetch of the same row.
-const POLL_MS = 30000;
+// Fix "Failed to construct 'URL': Invalid URL":
+// 1. CRA .env values must NOT be wrapped in quotes (they're read literally).
+// 2. A bare host ("servercon.onrender.com") without scheme crashes the URL
+//    parser -- auto-prepend https:// when no scheme is present.
+// 3. On localhost default to the LOCAL Flask backend so local dev doesn't
+//    wait on Render cold starts. Env override still wins when properly set.
+function resolveApiBase() {
+  const raw = (process.env.REACT_APP_API_BASE || '').trim().replace(/^["']|["']$/g, '');
+  if (raw) {
+    const withScheme = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(raw) ? raw : `https://${raw}`;
+    return withScheme.endsWith('/') ? withScheme.slice(0, -1) : withScheme;
+  }
+  if (typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)/.test(window.location.hostname)) {
+    return 'http://localhost:5000';
+  }
+  return 'https://servercon.onrender.com';
+}
+const API_BASE = resolveApiBase();
 const REQUEST_TIMEOUT_MS = 15000;
+const MAX_POINTS = 15; // rolling window so the chart never grows unbounded
 
 // Backend returns either { error: "..." }, { message: "..." }, or a raw string.
 // Stringify only as a last resort so the banner stays readable.
@@ -37,11 +52,15 @@ function App() {
   const [loading, setLoading] = useState(true);
 
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [live, setLive] = useState(false);
   const isMountedRef = useRef(true);
 
-  const fetchTargets = useCallback(async () => {
+  // Bottleneck #3 fix (REST polling): fetch the full history ONCE, then
+  // listen on the 'ping_update' websocket for fresh points and append them
+  // in place. No more 30s full re-fetch; chart updates the ms pings finish.
+  const fetchInitialData = useCallback(async () => {
     try {
-      // Connects to the Flask backend (Render prod, same as your working screenshot)
+      // Connects to the Flask backend (local Flask on localhost, Render prod otherwise)
       const response = await axios.get(`${API_BASE}/api/targets`, { timeout: REQUEST_TIMEOUT_MS });
       const data = Array.isArray(response.data) ? response.data : [];
       if (!isMountedRef.current) return;
@@ -51,7 +70,7 @@ function App() {
     } catch (error) {
       console.error("Error fetching data, Flask server might be down.", error);
       if (!isMountedRef.current) return;
-      // Don't wipe existing cards on a transient poll failure (Render cold start)
+      // Don't wipe existing cards on a transient failure (Render cold start)
       // — only show the error banner.
       if (error?.response) {
         setError(`Backend error ${error.response.status}: ${getFriendlyApiErrorMessage(error)}`);
@@ -67,14 +86,34 @@ function App() {
 
   useEffect(() => {
     isMountedRef.current = true;
-    fetchTargets();
-    // Auto-refresh the dashboard (matches backend PING_INTERVAL so the graph walks)
-    const interval = setInterval(fetchTargets, POLL_MS);
+    fetchInitialData();
+
+    // Live channel: server emits 'ping_update' with fresh points each cycle
+    const socket = io(API_BASE, { transports: ['websocket', 'polling'] });
+    socket.on('connect', () => { if (isMountedRef.current) setLive(true); });
+    socket.on('disconnect', () => { if (isMountedRef.current) setLive(false); });
+    socket.on('ping_update', (newPings) => {
+      if (!isMountedRef.current || !Array.isArray(newPings)) return;
+      setTargets((prevTargets) => prevTargets.map((target) => {
+        const ping = newPings.find((p) => p.site_id === target.site_id);
+        if (!ping) return target;
+        const point = {
+          latency_ms: Number(ping.latency_ms) || 0,
+          is_online: Boolean(ping.is_online),
+          time: ping.time,
+        };
+        const updatedLogs = [...(target.uptime_logs || []), point].slice(-MAX_POINTS);
+        return { ...target, is_online: point.is_online, uptime_logs: updatedLogs };
+      }));
+      setLastUpdated(new Date());
+      setError('');
+    });
+
     return () => {
       isMountedRef.current = false;
-      clearInterval(interval);
+      socket.disconnect();
     };
-  }, [fetchTargets]);
+  }, [fetchInitialData]);
 
   const handleAddTarget = async (e) => {
     e.preventDefault();
@@ -100,7 +139,7 @@ function App() {
       console.log("Added target:", res.data);
       setNewName('');
       setNewUrl('');
-      await fetchTargets();
+      await fetchInitialData();
     } catch (error) {
       console.error("Failed to add target", error);
       if (error?.response) {
@@ -119,7 +158,7 @@ function App() {
     <div className="dashboard-container">
       <header className="dashboard-header">
         <h1>Cloud Uptime Monitor</h1>
-        <p>Live Site Connectivity Checker{lastUpdated ? ` • Updated ${lastUpdated.toLocaleTimeString()}` : ''}</p>
+        <p>Live Site Connectivity Checker{lastUpdated ? ` • Updated ${lastUpdated.toLocaleTimeString()}` : ''}{live ? ' • ● LIVE' : ' • ○ connecting…'}</p>
       </header>
 
       <div className="add-target-panel">
@@ -169,7 +208,11 @@ function App() {
                     <XAxis dataKey="time" stroke="#888" tick={{ fontSize: 12 }} minTickGap={40} />
                     <YAxis dataKey="latency_ms" stroke="#888" tick={{ fontSize: 12 }} width={50} domain={['auto', 'auto']} />
                     <Tooltip contentStyle={{ backgroundColor: '#1e1e1e', border: 'none', color: '#fff' }} labelStyle={{ color: '#00ff9d' }} />
-                    <Line type="monotone" dataKey="latency_ms" stroke="#00ff9d" strokeWidth={2} dot={{ r: 3, fill: '#00ff9d' }} activeDot={{ r: 5 }} isAnimationActive={true} animationDuration={500} />
+                    {/* VISUAL FIX: dot={false} removes per-point dots for the
+                        smooth continuous reference-style line; activeDot shows
+                        a dot only on hover. Animation off so live appends
+                        don't replay the whole path. */}
+                    <Line type="monotone" dataKey="latency_ms" stroke="#00ff9d" strokeWidth={2} dot={false} activeDot={{ r: 5 }} isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
                 ) : (

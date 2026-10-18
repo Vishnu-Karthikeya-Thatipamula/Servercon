@@ -2,11 +2,13 @@ import atexit
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 import requests
 import mysql.connector
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
@@ -18,6 +20,8 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 app = Flask(__name__)
 # Allow requests from all origins (including your localhost and future frontend host)
 CORS(app, resources={r"/api/*": {"origins": "*"}})# Allows React (http://localhost:3000) to call this Flask API
+# Real-time pushes: SocketIO emits fresh ping points the ms the batch finishes
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DB_HOST = os.getenv("DB_HOST", "localhost") or "localhost"
 DB_USER = os.getenv("DB_USER", "root") or "root"
@@ -59,7 +63,9 @@ DB_PORT = _int_env("DB_PORT", 3306, min_value=1, max_value=65535)
 # NOTE: historic env name is PING_TIMEOUT; also accept REQUEST_TIMEOUT.
 REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 10, min_value=1, max_value=120,
                            aliases=("PING_TIMEOUT",))
-PING_INTERVAL = _int_env("PING_INTERVAL", 30, min_value=5, max_value=86400)
+# 1s updates: aggressive (sites may rate-limit; DB fills 30x faster).
+# Bump to 5-10s if charts flatline or Aiven storage spikes.
+PING_INTERVAL = _int_env("PING_INTERVAL", 1, min_value=1, max_value=86400)
 
 # Fail fast on an unsafe database identifier since it is interpolated
 # into CREATE DATABASE (identifiers cannot be parameterised).
@@ -158,9 +164,18 @@ def init_db():
     finally:
         _safe_close(conn)
 
-# The Background Worker: Pings sites and saves to MySQL
-def _ping_one(url):
-    """Ping a single URL. Returns (status_code, latency_ms, is_online)."""
+# The Background Worker: Pings sites in PARALLEL and saves to MySQL in bulk.
+# Bottleneck #1 fix (synchronous pinging): ThreadPoolExecutor(max_workers=20)
+# pings all targets at once instead of one-by-one, so 50 sites take ~2s
+# instead of ~50s. Results are bulk-inserted with a single executemany.
+HISTORY_LIMIT = _int_env("HISTORY_LIMIT", 15, min_value=5, max_value=300)
+PING_WORKERS = _int_env("PING_WORKERS", 20, min_value=1, max_value=100)
+
+
+def _ping_one(target):
+    """Worker: ping one target dict. Returns a React-ready result dict."""
+    site_id = target['site_id']
+    url = target['target_url']
     status_code = 0
     latency_ms = 0.0
     is_online = False
@@ -178,26 +193,40 @@ def _ping_one(url):
         print(f"[ping] {url} unreachable: {exc}")
     except Exception as exc:  # defensive: never let one URL kill the batch
         print(f"[ping] {url} unexpected error: {exc}")
-    return status_code, latency_ms, is_online
+    return {
+        'site_id': site_id,
+        'status_code': status_code,
+        'latency_ms': latency_ms,
+        'is_online': is_online,
+        'time': datetime.now().strftime('%H:%M:%S'),  # pre-formatted for React
+    }
 
 
-def ping_websites(site_id=None):
-    """Ping all targets (or a single site_id) and log results to MySQL."""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Pinging active targets...")
+def ping_websites(site_id=None, emit=True):
+    """Ping all targets (or one site_id) in parallel, bulk-insert, push live."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Pinging active targets in parallel...")
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
     except Exception as err:  # mysql errors + DNS/socket errors
         print(f"[ping] DB connection failed: {err}")
-        return
+        return []
+    results = []
     try:
         try:
             cursor = conn.cursor(dictionary=True)
         except Exception as err:
             print(f"[ping] Could not create cursor: {err}")
-            return
+            return []
         try:
+            # CLEANUP: keep the table lean -- drop logs older than 7 days
+            try:
+                cursor.execute("DELETE FROM uptime_logs WHERE ping_timestamp < NOW() - INTERVAL 7 DAY")
+            except mysql.connector.Error as err:
+                print(f"[ping] cleanup DELETE failed (non-fatal): {err}")
+                _safe_rollback(conn)
+
             try:
                 if site_id is None:
                     cursor.execute("SELECT site_id, target_url FROM monitored_targets")
@@ -209,35 +238,41 @@ def ping_websites(site_id=None):
                 targets = cursor.fetchall()
             except mysql.connector.Error as err:
                 print(f"[ping] SELECT failed: {err}")
-                return
+                return []
 
-            for target in targets:
-                target_id = target['site_id']
-                url = target['target_url']
+            if not targets:
+                return []
 
-                status_code, latency_ms, is_online = _ping_one(url)
+            # PARALLEL PING: all targets at once
+            with ThreadPoolExecutor(max_workers=PING_WORKERS) as executor:
+                results = list(executor.map(_ping_one, targets))
 
-                # Log the result (one target failing must not kill the whole batch)
-                try:
-                    cursor.execute("""
-                        INSERT INTO uptime_logs (site_id, status_code, latency_ms, is_online)
-                        VALUES (%s, %s, %s, %s)
-                    """, (target_id, status_code, latency_ms, is_online))
-                except mysql.connector.Error as err:
-                    print(f"[ping] INSERT failed for site {target_id}: {err}")
-                    _safe_rollback(conn)
-                    continue
-
+            # BULK INSERT: one executemany instead of N single INSERTs
             try:
+                cursor.executemany(
+                    """INSERT INTO uptime_logs (site_id, status_code, latency_ms, is_online)
+                       VALUES (%s, %s, %s, %s)""",
+                    [(r['site_id'], r['status_code'], r['latency_ms'], r['is_online'])
+                     for r in results],
+                )
                 conn.commit()
             except mysql.connector.Error as err:
-                print(f"[ping] COMMIT failed: {err}")
+                print(f"[ping] BULK INSERT failed: {err}")
                 _safe_rollback(conn)
+                return []
         finally:
             _safe_close(cursor)
             cursor = None
     finally:
         _safe_close(conn)
+
+    # WEBSOCKET PUSH: send only the fresh points; React appends them live
+    if emit and results:
+        try:
+            socketio.emit('ping_update', results)
+        except Exception as exc:
+            print(f"[ping] socket emit failed (non-fatal): {exc}")
+    return results
 
 # Background scheduler (Runs every PING_INTERVAL seconds).
 # NOTE: Created/started lazily via start_scheduler() from the __main__
@@ -286,6 +321,10 @@ def _shutdown_scheduler():
 atexit.register(_shutdown_scheduler)
 
 # API Route: Get all targets & their chart data for React
+# Bottleneck #2 fix (N+1 queries): exactly 2 SQL statements no matter how
+# many targets -- one for targets, one window-function query fetching the
+# last HISTORY_LIMIT logs for ALL targets at once. Logs are grouped in
+# Python memory. Tiebreak on log_id keeps same-second pings ordered.
 @app.route('/api/targets', methods=['GET'])
 def get_targets():
     conn = None
@@ -294,41 +333,51 @@ def get_targets():
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
 
+        # Query 1: all targets
         cursor.execute("SELECT site_id, friendly_name, target_url FROM monitored_targets ORDER BY site_id")
         targets = cursor.fetchall()
 
-        for target in targets:
-            site_id = target['site_id']
-            # Fetch the last 15 pings for the React line chart
-            cursor.execute("""
-                SELECT ping_timestamp, latency_ms, is_online
+        # Query 2: last HISTORY_LIMIT logs for every target in one shot
+        cursor.execute("""
+            WITH RankedLogs AS (
+                SELECT site_id, ping_timestamp, latency_ms, is_online,
+                       ROW_NUMBER() OVER (PARTITION BY site_id ORDER BY ping_timestamp DESC, log_id DESC) AS rn
                 FROM uptime_logs
-                WHERE site_id = %s
-                ORDER BY ping_timestamp DESC LIMIT 15
-            """, (site_id,))
-            logs = cursor.fetchall()
+            )
+            SELECT site_id, ping_timestamp, latency_ms, is_online
+            FROM RankedLogs
+            WHERE rn <= %s
+        """, (HISTORY_LIMIT,))
+        all_logs = cursor.fetchall()
 
-            for log in logs:
-                # Format the raw datetime object directly in Python
-                if log.get('ping_timestamp'):
-                    log['time'] = log['ping_timestamp'].strftime('%H:%M:%S')
-                else:
-                    log['time'] = None
-                
-                # Remove the raw datetime object so jsonify doesn't fail
-                log.pop('ping_timestamp', None)
+        # Group by site_id in memory
+        logs_by_site = {t['site_id']: [] for t in targets}
+        for log in all_logs:
+            # Format the raw datetime object directly in Python
+            if log.get('ping_timestamp'):
+                log['time'] = log['ping_timestamp'].strftime('%H:%M:%S')
+            else:
+                log['time'] = None
 
-                # mysql-connector returns TINYINT/Decimal; normalize for JSON/Recharts
-                log['is_online'] = bool(log.get('is_online'))
-                try:
-                    log['latency_ms'] = float(log.get('latency_ms', 0) or 0)
-                except (TypeError, ValueError):
-                    log['latency_ms'] = 0.0
+            # Remove the raw datetime object so jsonify doesn't fail
+            log.pop('ping_timestamp', None)
 
-            # Reverse to chronological order for the chart
-            target['uptime_logs'] = logs[::-1]
+            # mysql-connector returns TINYINT/Decimal; normalize for JSON/Recharts
+            log['is_online'] = bool(log.get('is_online'))
+            try:
+                log['latency_ms'] = float(log.get('latency_ms', 0) or 0)
+            except (TypeError, ValueError):
+                log['latency_ms'] = 0.0
+
+            if log['site_id'] in logs_by_site:
+                logs_by_site[log['site_id']].append(log)
+
+        for target in targets:
+            # Ranked query returns newest-first; reverse for chart left-to-right
+            site_logs = logs_by_site.get(target['site_id'], [])[::-1]
+            target['uptime_logs'] = site_logs
             # Determine current status based on the most recent log
-            target['is_online'] = bool(logs[0]['is_online']) if logs else False
+            target['is_online'] = bool(site_logs[-1]['is_online']) if site_logs else False
 
         return jsonify(targets)
     except mysql.connector.Error as err:
@@ -502,9 +551,10 @@ if __name__ == '__main__':
     # Ping once at boot so the React chart is not empty. Failure here
     # must not prevent the API from serving.
     try:
-        ping_websites()
+        ping_websites(emit=False)  # no socket listeners yet at boot
     except Exception as exc:
         print(f"[startup] Initial ping failed (server still running): {exc}")
 
-    # Runs the Flask server on Port 5000
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    # Runs the Flask+SocketIO server on Port 5000.
+    # IMPORTANT: use socketio.run, not app.run, or websocket pushes never work.
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True, use_reloader=False)
